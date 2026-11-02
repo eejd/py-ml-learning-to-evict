@@ -246,21 +246,37 @@ def monkey_patched_mha_forward(
 
         current_score_mod_fn = and_masks(external_mask_fn, current_score_mod_fn)
 
-    block_mask = create_block_mask_compiled(
-        current_score_mod_fn,
-        q.shape[0],  # B
-        q.shape[1],  # num_heads
-        q.shape[2],  # S_q
-        k_for_attention.shape[2],  # S_kv (s_cache_active_len)
-        device=q.device,
-    )
-
-    attn_output = flex_attention_compiled(
-        query=q,  # [B, num_heads, S_x, head_dim]
-        key=k_for_attention,  # [B, num_heads, s_cache_active_len, head_dim]
-        value=v_for_attention,  # [B, num_heads, s_cache_active_len, head_dim]
-        block_mask=block_mask,
-    )
+    if q.device.type in {"cpu", "mps"}:
+        # FlexAttention's compiled kernels require a supported compiler/device.
+        # SDPA uses the same boolean mask, including per-KV-head eviction.
+        keep = mask_from_cache_active.repeat_interleave(q_per_kv, dim=1)[:, :, None, :]
+        if apply_dynamic_causal_mask:
+            positions = input_pos
+            if positions is None:
+                positions = torch.arange(q.shape[2], device=q.device)[None, :]
+            key_positions = torch.arange(k_for_attention.shape[2], device=q.device)
+            keep = keep & (key_positions[None, None, None, :] <= positions[:, None, :, None])
+        if mask is not None:
+            external = mask[:, None, :, :] if mask.ndim == 3 else mask
+            keep = keep & external[..., :q.shape[2], :k_for_attention.shape[2]]
+        attn_output = torch.nn.functional.scaled_dot_product_attention(
+            q, k_for_attention, v_for_attention, attn_mask=keep
+        )
+    else:
+        block_mask = create_block_mask_compiled(
+            current_score_mod_fn,
+            q.shape[0],
+            q.shape[1],
+            q.shape[2],
+            k_for_attention.shape[2],
+            device=q.device,
+        )
+        attn_output = flex_attention_compiled(
+            query=q,
+            key=k_for_attention,
+            value=v_for_attention,
+            block_mask=block_mask,
+        )
 
     # Apply dropout if training (flex_attention doesn't have dropout_p)
     if self.attn_dropout > 0 and self.training:
